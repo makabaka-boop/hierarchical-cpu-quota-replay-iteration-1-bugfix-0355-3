@@ -206,6 +206,10 @@ type groupNode struct {
 	// 某个 tick 开头入账、对调度生效的转让，提交后尚待入账的转让在
 	// pending 中投影（见 projectedLocked）。
 	adjust int
+	// loans 是本组作为受让方、在当前周期仍有效的借用，按借用提交顺序
+	// 排列。执行扣减超出基础额度时按此顺序把用量归属到各笔借用的
+	// Consumed；周期边界随额度重置一并终结（只保留属于新周期的借用）。
+	loans []*LoanReceipt
 }
 
 // jobState 是作业的内部可变状态。
@@ -243,6 +247,8 @@ type Scheduler struct {
 
 	groups map[string]*groupNode
 	loans  map[string]*LoanReceipt
+	// loanOrder 记录借用建立的提交顺序，LoanReceipts 按此顺序输出。
+	loanOrder []string
 
 	jobs map[string]*jobState
 
@@ -326,6 +332,7 @@ func New(groups []GroupSpec) (*Scheduler, error) {
 
 	return &Scheduler{
 		groups: nodes,
+		loans:  map[string]*LoanReceipt{},
 		jobs:   make(map[string]*jobState),
 	}, nil
 }
@@ -384,6 +391,22 @@ func (s *Scheduler) nearestExhausted(path []string) string {
 		}
 	}
 	return ""
+}
+
+// attributeLoanLocked 把某组刚扣减的 1 个单位归属到额度来源：先基础额度，
+// 再按借用提交顺序消耗借入额度（不超过该笔 Amount − Returned 的余额）。
+// 超出基础额度与全部借用余额的扣减来自普通转让，不归属任何借用。
+// 子组执行沿路径对每个祖先调用本函数，因此祖先受让组的借用同样被计入。
+func (s *Scheduler) attributeLoanLocked(g *groupNode) {
+	if g.used <= g.spec.Quota {
+		return // 仍在基础额度内
+	}
+	for _, loan := range g.loans {
+		if loan.Consumed < loan.Amount-loan.Returned {
+			loan.Consumed++
+			return
+		}
+	}
 }
 
 // projectedLocked 投影“下一个进入 tick 开头完成周期重置与待入账转让后”
@@ -653,11 +676,20 @@ func (s *Scheduler) stepLocked(tick uint64) (TraceEntry, []OverdueEvidence) {
 	entry := TraceEntry{Tick: tick, Period: period}
 
 	// 1) 周期边界：周期首个 tick 清零所有组的已用配额与本周期转让净额，
-	//    有效额度恢复为基础额度。
+	//    有效额度恢复为基础额度；上一周期的借用同时终结，只有属于新周期
+	//    的借用（边界前临界提交、将在本 tick 入账）保留在归属序列中。
 	if tick%PeriodTicks == 0 {
+		period := tick / PeriodTicks
 		for _, g := range s.groups {
 			g.used = 0
 			g.adjust = 0
+			kept := g.loans[:0]
+			for _, loan := range g.loans {
+				if loan.Period == period {
+					kept = append(kept, loan)
+				}
+			}
+			g.loans = kept
 		}
 	}
 
@@ -702,8 +734,10 @@ func (s *Scheduler) stepLocked(tick uint64) (TraceEntry, []OverdueEvidence) {
 		entry.Group = s.jobs[chosen].group
 		entry.Path = append([]string(nil), chosenPath...)
 		for _, gid := range chosenPath {
-			s.groups[gid].used++
-			entry.Deducted = append(entry.Deducted, s.groups[gid].used)
+			g := s.groups[gid]
+			g.used++
+			entry.Deducted = append(entry.Deducted, g.used)
+			s.attributeLoanLocked(g)
 		}
 		j := s.jobs[chosen]
 		j.remaining -= WorkPerTick

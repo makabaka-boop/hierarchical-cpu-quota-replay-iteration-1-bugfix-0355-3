@@ -113,4 +113,6 @@ TransferLoan 以唯一借用编号建立本周期同父组配额转让；ReturnL
 受让组先消耗基础额度，再按借用提交顺序消耗借入额度；子组执行也计入对应祖先的使用。
 别的借用额度不能代替已消耗的本笔余额归还。周期结束所有旧借用终结，
 归还不退还历史 tick 扣减，不改变祖先额度；LoanReceipts 与快照、Applied 和超期证据一致。
+LoanReceipts 按借用建立顺序返回全部台账（含已终结的历史借用）：
+Consumed 是按上述顺序归属到该笔的累计消耗，可归还余额 = Amount − Consumed − Returned。
 
