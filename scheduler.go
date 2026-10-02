@@ -106,6 +106,10 @@ type AppliedChange struct {
 	// 仅 TRANSFER 使用：From 是捐出组、Group 是受让组、Amount 是转让量。
 	From   string
 	Amount int
+	// LoanID 仅对可追溯借用（TransferLoan/ReturnLoan）产生的 TRANSFER
+	// 非空：建立时 From=捐出组、Group=受让组；归还时 From=受让组、
+	// Group=捐出组。凭此可把轨迹中的建立/归还变更与 LoanReceipt 逐笔对上。
+	LoanID string
 }
 
 // TraceEntry 是一个 tick 的完整轨迹。
@@ -206,6 +210,10 @@ type groupNode struct {
 	// 某个 tick 开头入账、对调度生效的转让，提交后尚待入账的转让在
 	// pending 中投影（见 projectedLocked）。
 	adjust int
+	// activeLoans 是本组作为受让方、本周期仍可归属消耗的借用，按借用
+	// 提交（修订号）顺序排列；周期边界只保留属于新周期的借用（边界
+	// 临界提交的借用），旧周期借用全部终结。
+	activeLoans []*LoanReceipt
 }
 
 // jobState 是作业的内部可变状态。
@@ -227,6 +235,9 @@ type committedChange struct {
 	// 仅 TRANSFER 使用：from 为捐出组、group 为受让组、amount 为转让量。
 	from   string
 	amount int
+	// loanID 仅可追溯借用（TransferLoan/ReturnLoan）非空，随 Applied
+	// 进入轨迹，供与 LoanReceipt 逐笔核对。
+	loanID string
 }
 
 // Scheduler 是并发安全的单 CPU 租户调度模拟器。
@@ -243,6 +254,9 @@ type Scheduler struct {
 
 	groups map[string]*groupNode
 	loans  map[string]*LoanReceipt
+	// loanOrder 按建立（提交）顺序记录全部借用，供 LoanReceipts 确定性
+	// 输出；旧周期借用终结后仍保留在回执序列中作为审计记录。
+	loanOrder []*LoanReceipt
 
 	jobs map[string]*jobState
 
@@ -384,6 +398,37 @@ func (s *Scheduler) nearestExhausted(path []string) string {
 		}
 	}
 	return ""
+}
+
+// attributeLoanConsumption 把本组刚扣减的 1 个已用配额归属到具体额度来源：
+// 先消耗本组自有（非借用）有效额度，再按借用提交顺序消耗各笔借用的未归还
+// 余额。归属只在扣减发生时追加、周期内绝不回改历史归属，因此逐 tick 轨迹
+// （Path/Deducted）、各级已用配额与借用回执可以互相核对；子组作业执行时
+// 本组作为路径祖先被扣减，同样计入本组借用的消耗。
+//
+// 仅在 stepLocked 入账全部待处理变更之后调用，此时 adjust 已包含本周期
+// 全部已提交转让（含借用的建立与归还），与 activeLoans 口径一致。
+func (s *Scheduler) attributeLoanConsumption(g *groupNode) {
+	if len(g.activeLoans) == 0 {
+		return
+	}
+	borrowed, consumed := 0, 0
+	for _, l := range g.activeLoans {
+		borrowed += l.Amount - l.Returned
+		consumed += l.Consumed
+	}
+	// 自有（非借用）有效额度 = 有效额度 − 各笔借用未归还余额之和。
+	if g.used-consumed <= s.effectiveQuota(g)-borrowed {
+		return // 本次扣减记在本组自有额度上
+	}
+	// 自有额度已耗尽：归属到提交最早、仍有未归还余额的借用。可行性已保证
+	// used <= 有效额度，因此必然存在有剩余额度的借用。
+	for _, l := range g.activeLoans {
+		if l.Consumed < l.Amount-l.Returned {
+			l.Consumed++
+			return
+		}
+	}
 }
 
 // projectedLocked 投影“下一个进入 tick 开头完成周期重置与待入账转让后”
@@ -566,10 +611,10 @@ func (s *Scheduler) cancelLocked(jobID string, expectedRevision uint64) (CommitR
 func (s *Scheduler) Transfer(donor, receiver string, amount int, expectedRevision uint64) (CommitResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.transferLocked(donor, receiver, amount, expectedRevision)
+	return s.transferLocked(donor, receiver, amount, expectedRevision, "")
 }
 
-func (s *Scheduler) transferLocked(donor, receiver string, amount int, expectedRevision uint64) (CommitResult, error) {
+func (s *Scheduler) transferLocked(donor, receiver string, amount int, expectedRevision uint64, loanID string) (CommitResult, error) {
 	dg, ok := s.groups[donor]
 	if !ok {
 		return CommitResult{}, fmt.Errorf("%w: unknown donor group %q", ErrNotFound, donor)
@@ -603,7 +648,7 @@ func (s *Scheduler) transferLocked(donor, receiver string, amount int, expectedR
 	s.revision++
 	rev := s.revision
 	s.pending = append(s.pending, committedChange{
-		kind: ChangeTransfer, from: donor, group: receiver, amount: amount, revision: rev,
+		kind: ChangeTransfer, from: donor, group: receiver, amount: amount, revision: rev, loanID: loanID,
 	})
 	return CommitResult{Revision: rev, Now: s.now}, nil
 }
@@ -653,11 +698,19 @@ func (s *Scheduler) stepLocked(tick uint64) (TraceEntry, []OverdueEvidence) {
 	entry := TraceEntry{Tick: tick, Period: period}
 
 	// 1) 周期边界：周期首个 tick 清零所有组的已用配额与本周期转让净额，
-	//    有效额度恢复为基础额度。
+	//    有效额度恢复为基础额度；上一周期的借用全部终结，只保留属于
+	//    新周期的借用（边界 tick 前临界提交、本 tick 才入账的借用）。
 	if tick%PeriodTicks == 0 {
 		for _, g := range s.groups {
 			g.used = 0
 			g.adjust = 0
+			kept := g.activeLoans[:0]
+			for _, l := range g.activeLoans {
+				if l.Period >= period {
+					kept = append(kept, l)
+				}
+			}
+			g.activeLoans = kept
 		}
 	}
 
@@ -673,7 +726,7 @@ func (s *Scheduler) stepLocked(tick uint64) (TraceEntry, []OverdueEvidence) {
 			}
 			entry.Applied = append(entry.Applied, AppliedChange{
 				Kind: c.kind, JobID: c.jobID, Revision: c.revision, Group: c.group,
-				From: c.from, Amount: c.amount,
+				From: c.from, Amount: c.amount, LoanID: c.loanID,
 			})
 		}
 		s.pending = s.pending[:0]
@@ -703,6 +756,7 @@ func (s *Scheduler) stepLocked(tick uint64) (TraceEntry, []OverdueEvidence) {
 		entry.Path = append([]string(nil), chosenPath...)
 		for _, gid := range chosenPath {
 			s.groups[gid].used++
+			s.attributeLoanConsumption(s.groups[gid])
 			entry.Deducted = append(entry.Deducted, s.groups[gid].used)
 		}
 		j := s.jobs[chosen]
@@ -865,7 +919,11 @@ func RenderTrace(trace []TraceEntry) string {
 				case ChangeMigrate:
 					parts = append(parts, fmt.Sprintf("MIGRATE[%s->%s]@r%d", c.JobID, c.Group, c.Revision))
 				case ChangeTransfer:
-					parts = append(parts, fmt.Sprintf("TRANSFER[%s->%s x%d]@r%d", blankAsDash(c.From), c.Group, c.Amount, c.Revision))
+					if c.LoanID != "" {
+						parts = append(parts, fmt.Sprintf("TRANSFER[%s->%s x%d loan=%s]@r%d", blankAsDash(c.From), c.Group, c.Amount, c.LoanID, c.Revision))
+					} else {
+						parts = append(parts, fmt.Sprintf("TRANSFER[%s->%s x%d]@r%d", blankAsDash(c.From), c.Group, c.Amount, c.Revision))
+					}
 				default:
 					parts = append(parts, fmt.Sprintf("CANCEL[%s]@r%d", c.JobID, c.Revision))
 				}
